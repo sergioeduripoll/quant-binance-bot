@@ -167,6 +167,12 @@ class Engine:
         Guarda vela en DB y actualiza indicadores.
         """
         try:
+            # ── FIX: Log de entrada al callback ──
+            logger.info(
+                f"📝 Saving candle {symbol} | "
+                f"history_len={len(history)} | close={candle.close}"
+            )
+
             # Calcular indicadores para la vela cerrada
             all_candles = history  # ya incluye la vela cerrada
             indicators = calculate_all_indicators(all_candles) if len(all_candles) >= 30 else {}
@@ -188,7 +194,7 @@ class Engine:
             await db.insert_candle(candle_data)
 
         except Exception as e:
-            logger.error(f"Error en candle close {symbol}: {e}")
+            logger.error(f"Error en candle close {symbol}: {e}", exc_info=True)
 
     async def _on_ticker(self, data: dict):
         """

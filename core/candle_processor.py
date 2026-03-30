@@ -75,6 +75,7 @@ class CandleProcessor:
         self._on_close_callbacks: list[Callable] = []
         self._pre_close_fired: dict[str, int] = {}
         self._history_limit = 250
+        self._kline_count = 0
 
     def on_pre_close(self, callback: Callable):
         """Registra callback para pre-cierre de vela (3s antes)."""
@@ -92,6 +93,14 @@ class CandleProcessor:
         candle = CandleData(data)
         symbol = candle.symbol
 
+        # ── FIX: Log de diagnóstico para confirmar que klines llegan ──
+        self._kline_count += 1
+        if self._kline_count <= 5 or self._kline_count % 500 == 0:
+            logger.info(
+                f"KLINE #{self._kline_count} | {symbol} | "
+                f"close={candle.close} | is_closed={candle.is_closed}"
+            )
+
         # Actualizar vela actual
         self._current_candles[symbol] = candle
 
@@ -107,8 +116,9 @@ class CandleProcessor:
             and not candle.is_closed
         ):
             self._pre_close_fired[candle_key] = now_ms
-            logger.debug(
-                f"PRE-CLOSE {symbol} | "
+            # ── FIX: Cambiado de debug a INFO ──
+            logger.info(
+                f"⏱ PRE-CLOSE {symbol} | "
                 f"{CANDLE_PRE_CLOSE_SECONDS}s antes del cierre | "
                 f"Close: {candle.close}"
             )
@@ -120,10 +130,11 @@ class CandleProcessor:
 
         # ── Check cierre confirmado ──
         if candle.is_closed:
-            logger.debug(
-                f"CANDLE CLOSED {symbol} | "
+            # ── FIX: Cambiado de debug a INFO ──
+            logger.info(
+                f"🕯 CANDLE CLOSED {symbol} | "
                 f"O:{candle.open} H:{candle.high} L:{candle.low} C:{candle.close} "
-                f"V:{candle.volume:.0f}"
+                f"V:{candle.volume:.0f} | history={len(self._candle_history[symbol])}"
             )
             # Agregar a historial
             history = self._candle_history[symbol]

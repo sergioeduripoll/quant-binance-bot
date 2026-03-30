@@ -30,6 +30,7 @@ class WebSocketManager:
         self._reconnect_delay = 1
         self._max_reconnect_delay = 60
         self._last_message_time = 0
+        self._message_count = 0
 
     def on_kline(self, callback: Callable):
         """Registra callback para datos de velas."""
@@ -40,7 +41,23 @@ class WebSocketManager:
         self._callbacks["ticker"].append(callback)
 
     def _build_stream_url(self) -> str:
-        """Construye la URL del stream combinado."""
+        """
+        Construye la URL del combined stream de Binance Futures.
+        
+        ╔══════════════════════════════════════════════════════════╗
+        ║  FIX #1 — URL CORREGIDA                                ║
+        ║                                                         ║
+        ║  ANTES (MAL):                                           ║
+        ║  wss://fstream.binance.com/ws/stream?streams=...        ║
+        ║  → El /ws es para single stream. Al agregar /stream     ║
+        ║    encima, Binance conecta pero NO envía datos.         ║
+        ║                                                         ║
+        ║  AHORA (BIEN):                                          ║
+        ║  wss://fstream.binance.com/stream?streams=...           ║
+        ║  → Endpoint correcto para combined streams.             ║
+        ║    Binance envía mensajes con wrapper {stream, data}.   ║
+        ╚══════════════════════════════════════════════════════════╝
+        """
         symbols = get_all_symbols()
         streams = []
         for sym in symbols:
@@ -48,12 +65,44 @@ class WebSocketManager:
             streams.append(f"{s}@kline_{CANDLE_INTERVAL}")
             streams.append(f"{s}@miniTicker")
         stream_path = "/".join(streams)
-        return f"{BINANCE_WS_BASE}/stream?streams={stream_path}"
+
+        # BINANCE_WS_BASE = "wss://fstream.binance.com/ws"
+        # Necesitamos quitar el /ws y usar /stream para combined streams
+        base = BINANCE_WS_BASE.replace("/ws", "")
+        url = f"{base}/stream?streams={stream_path}"
+
+        logger.info(f"WebSocket URL: {url[:120]}...")
+        return url
 
     async def _dispatch(self, data: dict):
         """Distribuye datos a los callbacks registrados."""
         stream = data.get("stream", "")
         payload = data.get("data", {})
+
+        # ── FIX #2: Log de diagnóstico para verificar flujo de datos ──
+        self._message_count += 1
+        if self._message_count <= 3 or self._message_count % 1000 == 0:
+            logger.info(
+                f"WS message #{self._message_count} | "
+                f"stream={stream[:40]} | keys={list(data.keys())}"
+            )
+
+        if not stream:
+            # Si no viene wrapper de combined stream, intentar formato single
+            event = data.get("e", "")
+            if event == "kline":
+                for cb in self._callbacks["kline"]:
+                    try:
+                        await cb(data)
+                    except Exception as e:
+                        logger.error(f"Error en callback kline (single): {e}")
+            elif event in ("24hrMiniTicker", "miniTicker"):
+                for cb in self._callbacks["ticker"]:
+                    try:
+                        await cb(data)
+                    except Exception as e:
+                        logger.error(f"Error en callback ticker (single): {e}")
+            return
 
         if "@kline" in stream:
             for cb in self._callbacks["kline"]:
@@ -86,6 +135,7 @@ class WebSocketManager:
                 ) as ws:
                     self._ws = ws
                     self._reconnect_delay = 1
+                    self._message_count = 0
                     logger.info("WebSocket conectado exitosamente")
 
                     async for message in ws:

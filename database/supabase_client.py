@@ -27,6 +27,15 @@ class SupabaseClient:
     def initialize(self):
         """Inicializa la conexión con Supabase."""
         if self._client is None:
+            # ── FIX: Log de diagnóstico para verificar credenciales ──
+            url_preview = SUPABASE_URL[:40] if SUPABASE_URL else "(VACÍO)"
+            key_preview = SUPABASE_SERVICE_KEY[:15] + "..." if SUPABASE_SERVICE_KEY else "(VACÍO)"
+            logger.info(f"Connecting to Supabase: URL={url_preview} KEY={key_preview}")
+
+            if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+                logger.error("SUPABASE_URL o SUPABASE_SERVICE_KEY están vacíos!")
+                raise ValueError("Supabase credentials missing")
+
             self._client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
             logger.info("Supabase client initialized")
 
@@ -45,8 +54,10 @@ class SupabaseClient:
             if result.data:
                 logger.info(f"Trade insertado: {result.data[0]['id']}")
                 return result.data[0]
+            else:
+                logger.warning(f"Trade insert retornó data vacía: {result}")
         except Exception as e:
-            logger.error(f"Error insertando trade: {e}")
+            logger.error(f"Error insertando trade: {e}", exc_info=True)
         return None
 
     async def update_trade(self, trade_id: str, update_data: dict) -> dict | None:
@@ -63,7 +74,7 @@ class SupabaseClient:
                 logger.info(f"Trade actualizado: {trade_id}")
                 return result.data[0]
         except Exception as e:
-            logger.error(f"Error actualizando trade {trade_id}: {e}")
+            logger.error(f"Error actualizando trade {trade_id}: {e}", exc_info=True)
         return None
 
     async def get_open_trades(self, symbol: str = None) -> list[dict]:
@@ -117,11 +128,27 @@ class SupabaseClient:
     async def insert_candle(self, candle_data: dict) -> None:
         """Inserta o actualiza una vela con sus indicadores."""
         try:
-            self.client.table("futures_candles").upsert(
+            result = self.client.table("futures_candles").upsert(
                 candle_data, on_conflict="symbol,open_time"
             ).execute()
+            # ── FIX: Log de éxito para confirmar que los datos llegan ──
+            if result.data:
+                logger.info(
+                    f"✅ Candle saved: {candle_data.get('symbol')} | "
+                    f"open_time={candle_data.get('open_time')} | "
+                    f"close={candle_data.get('close')}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ Candle upsert returned empty: {candle_data.get('symbol')} | "
+                    f"result={result}"
+                )
         except Exception as e:
-            logger.error(f"Error insertando vela: {e}")
+            # ── FIX: exc_info=True para ver traceback completo ──
+            logger.error(
+                f"❌ Error insertando vela {candle_data.get('symbol')}: {e}",
+                exc_info=True,
+            )
 
     async def get_candles(
         self, symbol: str, limit: int = 200
@@ -149,9 +176,15 @@ class SupabaseClient:
             result = (
                 self.client.table("futures_signals").insert(signal_data).execute()
             )
+            if result.data:
+                logger.info(
+                    f"Signal saved: {signal_data.get('symbol')} "
+                    f"{signal_data.get('signal_type')} "
+                    f"conf={signal_data.get('confidence')}"
+                )
             return result.data[0] if result.data else None
         except Exception as e:
-            logger.error(f"Error insertando señal: {e}")
+            logger.error(f"Error insertando señal: {e}", exc_info=True)
             return None
 
     # ── Bot State ──────────────────────────────────────────
