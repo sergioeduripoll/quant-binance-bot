@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  scalping-bot:
+    build: .
+    container_name: scalping-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+    networks:
+      - bot-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  bot-network:
+    driver: bridge
