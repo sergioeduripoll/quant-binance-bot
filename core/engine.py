@@ -4,7 +4,7 @@ Orquesta todos los componentes: WebSocket, estrategia, ejecución, ML.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config.settings import (
     BOT_MODE, BotMode, ML_RETRAIN_INTERVAL_HOURS,
@@ -24,18 +24,13 @@ from utils.helpers import seconds_until_candle_close
 
 logger = get_logger(__name__)
 
+# Días de retención de datos
+DATA_RETENTION_DAYS = 15
+
 
 class Engine:
     """
     Orquestador principal del bot.
-    
-    Ciclo de vida:
-    1. Inicialización: DB, ML, WebSocket
-    2. Recepción de datos via WebSocket
-    3. Pre-close: análisis y generación de señales
-    4. Ejecución: apertura de posiciones
-    5. Monitoreo: trailing stop, cierre de posiciones
-    6. ML: re-entrenamiento periódico
     """
 
     def __init__(self):
@@ -46,7 +41,8 @@ class Engine:
         self.predictor = Predictor()
         self.notifier = TelegramNotifier()
         self._running = False
-        self._status_interval = 3600  # Status cada 1 hora
+        self._status_interval = 3600
+        self._last_prune_date = None  # Para ejecutar pruning 1 vez al día
 
     async def start(self):
         """Inicia el bot."""
@@ -79,10 +75,12 @@ class Engine:
 
             # ── 6. Notificar inicio ──
             balance = await self._get_balance()
+            open_trades = await db.get_open_trades()
             await self.notifier.send_message(
                 f"🚀 <b>Bot Scalping iniciado</b>\n"
                 f"Modo: {BOT_MODE.value}\n"
                 f"Balance: ${balance:.2f}\n"
+                f"Posiciones abiertas: {len(open_trades)}\n"
                 f"Pares: {', '.join(get_all_symbols())}\n"
                 f"ML: {'✅ Ready' if self.predictor.is_ready else '⏳ Collecting data'}"
             )
@@ -93,6 +91,7 @@ class Engine:
                 self.ws_manager.connect(),
                 self._status_loop(),
                 self._ml_retrain_loop(),
+                self._pruning_loop(),
             )
 
         except Exception as e:
@@ -103,13 +102,7 @@ class Engine:
             await self.shutdown()
 
     async def _initialize_balance(self):
-        """
-        Inicializa el balance virtual para TEST/PAPER.
-        
-        Si futures_bot_state no tiene registro o tiene balance 0,
-        lo crea/actualiza con TEST_INITIAL_BALANCE.
-        Solo aplica en modos TEST y PAPER.
-        """
+        """Inicializa el balance virtual para TEST/PAPER."""
         if BOT_MODE == BotMode.LIVE:
             logger.info("Modo LIVE: balance real de Binance")
             return
@@ -117,27 +110,17 @@ class Engine:
         state = await db.get_bot_state()
 
         if state is None:
-            # No existe registro → crear con balance inicial
-            logger.info(
-                f"Creando estado inicial: ${TEST_INITIAL_BALANCE:.2f} USDT"
-            )
+            logger.info(f"Creando estado inicial: ${TEST_INITIAL_BALANCE:.2f} USDT")
             try:
                 db.client.table("futures_bot_state").insert({
                     "total_balance": TEST_INITIAL_BALANCE,
                     "available_balance": TEST_INITIAL_BALANCE,
                     "unrealized_pnl": 0,
-                    "daily_pnl": 0,
-                    "daily_trades": 0,
-                    "daily_wins": 0,
-                    "daily_losses": 0,
-                    "total_trades": 0,
-                    "total_wins": 0,
-                    "total_losses": 0,
-                    "win_rate": 0,
-                    "avg_win": 0,
-                    "avg_loss": 0,
-                    "profit_factor": 0,
-                    "max_drawdown": 0,
+                    "daily_pnl": 0, "daily_trades": 0,
+                    "daily_wins": 0, "daily_losses": 0,
+                    "total_trades": 0, "total_wins": 0, "total_losses": 0,
+                    "win_rate": 0, "avg_win": 0, "avg_loss": 0,
+                    "profit_factor": 0, "max_drawdown": 0,
                     "samples_collected": 0,
                 }).execute()
                 logger.info(f"✅ Bot state creado: ${TEST_INITIAL_BALANCE:.2f}")
@@ -145,22 +128,14 @@ class Engine:
                 logger.error(f"Error creando bot_state: {e}")
 
         elif float(state.get("total_balance", 0)) == 0:
-            # Existe pero balance es 0 → actualizar
-            logger.info(
-                f"Balance actual: $0. Seteando a ${TEST_INITIAL_BALANCE:.2f}"
-            )
+            logger.info(f"Balance 0. Seteando a ${TEST_INITIAL_BALANCE:.2f}")
             await db.update_bot_state({
                 "total_balance": TEST_INITIAL_BALANCE,
                 "available_balance": TEST_INITIAL_BALANCE,
             })
-            logger.info(f"✅ Balance actualizado: ${TEST_INITIAL_BALANCE:.2f}")
-
         else:
-            current = float(state.get("total_balance", 0))
-            logger.info(
-                f"Balance existente: ${current:.2f} USDT "
-                f"(no se resetea automáticamente)"
-            )
+            bal = float(state.get("total_balance", 0))
+            logger.info(f"Balance existente: ${bal:.2f} USDT")
 
     async def shutdown(self):
         """Apaga el bot de forma limpia."""
@@ -182,23 +157,26 @@ class Engine:
             else:
                 logger.info(f"No history for {symbol}, will build from WebSocket")
 
+    # ──────────────────────────────────────────────────────
+    # CALLBACKS DE MERCADO
+    # ──────────────────────────────────────────────────────
+
     async def _on_pre_close(self, symbol: str, candle, history: list):
         """
-        Callback de pre-cierre de vela (3s antes).
-        Aquí se ejecuta el análisis y la decisión de trading.
+        Pre-cierre de vela (3s antes).
+        Genera señales y abre posiciones en TODOS los modos no-LIVE.
         """
         try:
-            # ── Analizar ──
             signal = await self.strategy.analyze(symbol, candle, history)
             if signal is None or signal.signal_type == "NEUTRAL":
                 return
 
             logger.info(
-                f"SIGNAL: {symbol} {signal.signal_type} "
+                f"🔔 SIGNAL: {symbol} {signal.signal_type} "
                 f"conf={signal.confidence:.2f}"
             )
 
-            # ── Registrar señal en DB ──
+            # Registrar señal en DB
             await db.insert_signal({
                 "symbol": symbol,
                 "signal_type": signal.signal_type,
@@ -210,25 +188,28 @@ class Engine:
                 "indicators": signal.indicators,
             })
 
-            # ── Ejecutar si el modo lo permite ──
-            if BOT_MODE in (BotMode.PAPER, BotMode.LIVE):
+            # ── CAMBIO CLAVE: TEST y PAPER ahora abren posiciones ──
+            # En modo LIVE esto también funciona con órdenes reales.
+            # La diferencia está en order_manager que simula en TEST/PAPER.
+            if BOT_MODE != BotMode.LIVE:
+                success = await self.position_mgr.open_position(signal)
+                if success:
+                    logger.info(
+                        f"📈 PAPER TRADE OPENED: {symbol} {signal.signal_type}"
+                    )
+            else:
                 success = await self.position_mgr.open_position(signal)
                 if success:
                     logger.info(f"Position opened: {symbol} {signal.signal_type}")
-            elif BOT_MODE == BotMode.TEST:
-                # En modo TEST solo recolectamos datos
-                logger.info(
-                    f"[TEST] Signal recorded: {symbol} {signal.signal_type} "
-                    f"conf={signal.confidence:.2f}"
-                )
 
         except Exception as e:
             logger.error(f"Error en pre-close {symbol}: {e}", exc_info=True)
 
     async def _on_candle_close(self, symbol: str, candle, history: list):
         """
-        Callback de cierre confirmado de vela.
-        Guarda vela en DB y actualiza indicadores.
+        Cierre confirmado de vela.
+        1. Guarda vela en DB con indicadores
+        2. Verifica posiciones abiertas contra high/low de la vela
         """
         try:
             logger.info(
@@ -236,11 +217,15 @@ class Engine:
                 f"history_len={len(history)} | close={candle.close}"
             )
 
-            # Calcular indicadores para la vela cerrada
-            all_candles = history  # ya incluye la vela cerrada
-            indicators = calculate_all_indicators(all_candles) if len(all_candles) >= 30 else {}
+            # ── Calcular indicadores ──
+            all_candles = history
+            indicators = (
+                calculate_all_indicators(all_candles)
+                if len(all_candles) >= 30
+                else {}
+            )
 
-            # Guardar vela con indicadores
+            # ── Guardar vela ──
             candle_data = candle.to_dict()
             candle_data.update({
                 "rsi_14": indicators.get("rsi_14"),
@@ -256,13 +241,23 @@ class Engine:
             })
             await db.insert_candle(candle_data)
 
+            # ── Verificar posiciones con high/low de la vela cerrada ──
+            # Esto es más preciso que solo usar el close price
+            if BOT_MODE != BotMode.LIVE:
+                await self.position_mgr.check_positions_candle(
+                    symbol=symbol,
+                    high=candle.high,
+                    low=candle.low,
+                    close=candle.close,
+                )
+
         except Exception as e:
             logger.error(f"Error en candle close {symbol}: {e}", exc_info=True)
 
     async def _on_ticker(self, data: dict):
         """
-        Callback de ticker (actualización de precio en tiempo real).
-        Usado para monitorear trailing stop entre velas.
+        Ticker en tiempo real.
+        Actualiza trailing stop entre velas.
         """
         try:
             symbol = data.get("s", "")
@@ -271,6 +266,10 @@ class Engine:
                 await self.position_mgr.check_positions(symbol, current_price)
         except Exception as e:
             logger.error(f"Error en ticker: {e}")
+
+    # ──────────────────────────────────────────────────────
+    # LOOPS DE MANTENIMIENTO
+    # ──────────────────────────────────────────────────────
 
     async def _status_loop(self):
         """Envía status periódico por Telegram."""
@@ -301,7 +300,7 @@ class Engine:
         """Verifica periódicamente si el modelo ML necesita re-entrenarse."""
         while self._running:
             try:
-                await asyncio.sleep(3600)  # Check cada hora
+                await asyncio.sleep(3600)
                 if not self._running:
                     break
 
@@ -314,13 +313,55 @@ class Engine:
             except Exception as e:
                 logger.error(f"Error en ML retrain loop: {e}")
 
+    async def _pruning_loop(self):
+        """
+        Limpieza diaria de datos antiguos.
+        Se ejecuta una vez al día después de medianoche UTC.
+        Borra velas, señales y trades con más de DATA_RETENTION_DAYS días.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(300)  # Check cada 5 minutos
+                if not self._running:
+                    break
+
+                now_utc = datetime.now(timezone.utc)
+                today = now_utc.date()
+
+                # Ejecutar solo una vez al día, después de las 00:05 UTC
+                if (
+                    self._last_prune_date != today
+                    and now_utc.hour == 0
+                    and now_utc.minute >= 5
+                ):
+                    self._last_prune_date = today
+                    logger.info(
+                        f"🧹 Iniciando pruning diario "
+                        f"(retención: {DATA_RETENTION_DAYS} días)..."
+                    )
+
+                    deleted = await db.prune_old_data(days=DATA_RETENTION_DAYS)
+
+                    logger.info(
+                        f"🧹 Pruning completado: "
+                        f"candles={deleted.get('candles', 0)} "
+                        f"signals={deleted.get('signals', 0)} "
+                        f"trades={deleted.get('trades', 0)}"
+                    )
+
+                    await self.notifier.send_message(
+                        f"🧹 <b>Limpieza diaria completada</b>\n"
+                        f"Eliminados datos > {DATA_RETENTION_DAYS} días:\n"
+                        f"• Velas: {deleted.get('candles', 0)}\n"
+                        f"• Señales: {deleted.get('signals', 0)}\n"
+                        f"• Trades cerrados: {deleted.get('trades', 0)}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error en pruning loop: {e}")
+
     async def _get_balance(self) -> float:
-        """
-        Obtiene balance según el modo.
-        
-        - LIVE: balance real de Binance API
-        - TEST/PAPER: balance virtual de futures_bot_state
-        """
+        """Obtiene balance según el modo."""
         if BOT_MODE == BotMode.LIVE:
             return await self.position_mgr.order_mgr.get_balance()
 

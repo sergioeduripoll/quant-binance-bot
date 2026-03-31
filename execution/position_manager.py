@@ -36,14 +36,6 @@ class PositionManager:
     async def open_position(self, signal: Signal) -> bool:
         """
         Abre una posición basada en una señal.
-        
-        Flujo:
-        1. Verificar riesgo global
-        2. Calcular tamaño de posición
-        3. Ejecutar entrada
-        4. Registrar en DB
-        5. Configurar trailing stop
-        6. Notificar por Telegram
         """
         symbol = signal.symbol
         pair_config = get_pair_config(symbol)
@@ -53,7 +45,6 @@ class PositionManager:
         # ── 1. Balance y riesgo ──
         balance = await self.order_mgr.get_balance()
         if BOT_MODE != BotMode.LIVE:
-            # En modo test/paper, usar balance simulado
             state = await db.get_bot_state()
             balance = float(state.get("total_balance", 100)) if state else 100.0
 
@@ -150,32 +141,85 @@ class PositionManager:
             tp=signal.suggested_tp,
             confidence=signal.confidence,
             reasons=signal.reasons,
+            balance=balance,
+            margin=sizing["margin_required"],
         )
 
         logger.info(
-            f"POSITION OPENED: {symbol} {signal.signal_type} "
+            f"📈 POSITION OPENED: {symbol} {signal.signal_type} "
             f"qty={sizing['quantity']} lev={sizing['leverage']}x "
-            f"entry={entry_price} SL={signal.suggested_sl} TP={signal.suggested_tp}"
+            f"entry={entry_price} SL={signal.suggested_sl} TP={signal.suggested_tp} "
+            f"margin=${sizing['margin_required']:.2f}"
         )
 
         return True
 
     async def check_positions(self, symbol: str, current_price: float, atr: float = None):
         """
-        Verifica estado de posiciones abiertas.
-        Actualiza trailing y detecta cierres.
+        Verifica posiciones en tiempo real (ticker).
+        Solo actualiza trailing, no cierra posiciones.
+        Los cierres se hacen en check_positions_candle.
         """
-        # Actualizar trailing stop
         await self.trailing_mgr.check_and_update(symbol, current_price, atr)
 
-        # Verificar si alguna posición fue cerrada en Binance
-        if BOT_MODE == BotMode.LIVE:
-            await self._sync_positions_with_exchange(symbol)
-        else:
-            await self._simulate_position_check(symbol, current_price)
+    async def check_positions_candle(
+        self,
+        symbol: str,
+        high: float,
+        low: float,
+        close: float,
+    ):
+        """
+        Verifica posiciones al cierre de vela usando high/low.
+
+        Más preciso que solo usar close: una vela puede haber
+        tocado el SL o TP durante su vida incluso si el close
+        está en otro lugar.
+
+        Lógica de prioridad: si una vela toca AMBOS SL y TP,
+        se asume que tocó el más cercano al open primero.
+        """
+        for trade_id, state in list(self.trailing_mgr.get_active_positions().items()):
+            if state.symbol != symbol:
+                continue
+
+            hit_sl = False
+            hit_tp = False
+
+            if state.side == "LONG":
+                hit_sl = low <= state.current_sl
+                hit_tp = high >= state.current_tp
+            else:  # SHORT
+                hit_sl = high >= state.current_sl
+                hit_tp = low <= state.current_tp
+
+            if hit_sl and hit_tp:
+                # Ambos tocados: el más cercano al entry gana
+                sl_dist = abs(state.entry_price - state.current_sl)
+                tp_dist = abs(state.entry_price - state.current_tp)
+                if sl_dist <= tp_dist:
+                    hit_tp = False  # SL estaba más cerca
+                else:
+                    hit_sl = False  # TP estaba más cerca
+
+            if hit_tp:
+                await self._close_trade(
+                    trade_id=trade_id,
+                    state=state,
+                    exit_price=state.current_tp,
+                    exit_reason="TP",
+                )
+            elif hit_sl:
+                exit_reason = "TRAILING_SL" if state.breakeven_set else "SL"
+                await self._close_trade(
+                    trade_id=trade_id,
+                    state=state,
+                    exit_price=state.current_sl,
+                    exit_reason=exit_reason,
+                )
 
     async def _simulate_position_check(self, symbol: str, current_price: float):
-        """Simula verificación de posiciones en modo TEST/PAPER."""
+        """Simula verificación de posiciones con precio actual."""
         for trade_id, state in list(self.trailing_mgr.get_active_positions().items()):
             if state.symbol != symbol:
                 continue
@@ -193,7 +237,7 @@ class PositionManager:
                     closed = True
                     exit_reason = "TP"
                     exit_price = state.current_tp
-            else:  # SHORT
+            else:
                 if current_price >= state.current_sl:
                     closed = True
                     exit_reason = "TRAILING_SL" if state.breakeven_set else "SL"
@@ -222,14 +266,16 @@ class PositionManager:
 
             binance_pos = position_map.get(symbol)
             if binance_pos is None or float(binance_pos.get("positionAmt", 0)) == 0:
-                # Posición cerrada en exchange
-                open_orders = await self.order_mgr.get_open_orders(symbol)
-                mark_price = float(binance_pos.get("markPrice", state.entry_price)) if binance_pos else state.entry_price
+                mark_price = (
+                    float(binance_pos.get("markPrice", state.entry_price))
+                    if binance_pos
+                    else state.entry_price
+                )
                 await self._close_trade(
                     trade_id=trade_id,
                     state=state,
                     exit_price=mark_price,
-                    exit_reason="TP",  # Asumimos TP si no hay posición
+                    exit_reason="TP",
                 )
 
     async def _close_trade(
@@ -239,7 +285,7 @@ class PositionManager:
         exit_price: float,
         exit_reason: str,
     ):
-        """Cierra un trade y registra resultado."""
+        """Cierra un trade, actualiza wallet y notifica."""
         pnl_gross = calculate_pnl(
             state.entry_price, exit_price, state.quantity, state.side
         )
@@ -249,9 +295,13 @@ class PositionManager:
             exit_maker=(exit_reason == "TP"),
         )
         pnl_net = pnl_gross - commission
-        pnl_pct = (pnl_net / (state.entry_price * state.quantity)) * 100 * state.leverage
+        pnl_pct = (
+            (pnl_net / (state.entry_price * state.quantity))
+            * 100
+            * state.leverage
+        )
 
-        # Actualizar DB
+        # ── Actualizar trade en DB ──
         await db.update_trade(trade_id, {
             "exit_price": exit_price,
             "exit_reason": exit_reason,
@@ -264,13 +314,16 @@ class PositionManager:
             "status": "CLOSED",
         })
 
-        # Actualizar riesgo
+        # ── Actualizar wallet balance ──
+        new_balance = await db.update_wallet_balance(pnl_net)
+
+        # ── Actualizar riesgo en memoria ──
         self.risk_mgr.update_daily_pnl(pnl_net)
 
-        # Remover del trailing
+        # ── Remover del trailing ──
         self.trailing_mgr.unregister_position(trade_id)
 
-        # Notificar
+        # ── Notificar con saldo actualizado ──
         await self.notifier.notify_close(
             symbol=state.symbol,
             side=state.side,
@@ -284,6 +337,7 @@ class PositionManager:
             commission=commission,
             exit_reason=exit_reason,
             trail_count=state.trail_count,
+            new_balance=new_balance,
         )
 
         emoji = "✅" if pnl_net > 0 else "❌"
@@ -291,7 +345,8 @@ class PositionManager:
             f"{emoji} POSITION CLOSED: {state.symbol} {state.side} "
             f"entry={state.entry_price} exit={exit_price} "
             f"PnL={format_usdt(pnl_net)} ({pnl_pct:+.2f}%) "
-            f"reason={exit_reason} trails={state.trail_count}"
+            f"reason={exit_reason} trails={state.trail_count} "
+            f"balance=${new_balance:.2f}"
         )
 
     async def close(self):

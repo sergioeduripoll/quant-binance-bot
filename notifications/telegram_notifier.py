@@ -58,8 +58,10 @@ class TelegramNotifier:
         tp: float,
         confidence: float,
         reasons: list[str],
+        balance: float = 0,
+        margin: float = 0,
     ):
-        """Notifica apertura de operación."""
+        """Notifica apertura de operación con margen y saldo."""
         emoji = "🟢" if side == "LONG" else "🔴"
         notional = entry_price * quantity
         reasons_text = "\n".join(f"  • {r}" for r in reasons[:5])
@@ -73,10 +75,13 @@ class TelegramNotifier:
             f"<b>Cantidad:</b> {quantity}\n"
             f"<b>Apalancamiento:</b> {leverage}x\n"
             f"<b>Notional:</b> {format_usdt(notional)}\n"
+            f"<b>Margen usado:</b> {format_usdt(margin)}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"<b>🎯 TP:</b> {format_usdt(tp)}\n"
             f"<b>🛑 SL:</b> {format_usdt(sl)}\n"
             f"<b>📊 Confianza:</b> {confidence:.0%}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>💰 Saldo cuenta:</b> {format_usdt(balance)}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Razones:</b>\n{reasons_text}"
         )
@@ -97,8 +102,9 @@ class TelegramNotifier:
         commission: float,
         exit_reason: str,
         trail_count: int = 0,
+        new_balance: float = 0,
     ):
-        """Notifica cierre de operación."""
+        """Notifica cierre de operación con saldo actualizado."""
         if pnl_net > 0:
             emoji = "✅"
             result = "GANANCIA"
@@ -128,7 +134,9 @@ class TelegramNotifier:
             f"<b>ROI:</b> {format_percentage(pnl_pct)}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Apalancamiento:</b> {leverage}x\n"
-            f"<b>Trailing updates:</b> {trail_count}"
+            f"<b>Trailing updates:</b> {trail_count}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>💰 Saldo actualizado:</b> {format_usdt(new_balance)}"
         )
 
         await self.send_message(msg)

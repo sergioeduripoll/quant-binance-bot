@@ -4,7 +4,7 @@ Maneja todas las operaciones CRUD con la base de datos.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 from supabase import create_client, Client
 from config.settings import SUPABASE_URL, SUPABASE_SERVICE_KEY
@@ -27,13 +27,11 @@ class SupabaseClient:
     def initialize(self):
         """Inicializa la conexión con Supabase."""
         if self._client is None:
-            # ── FIX: Log de diagnóstico para verificar credenciales ──
             url_preview = SUPABASE_URL[:40] if SUPABASE_URL else "(VACÍO)"
             key_preview = SUPABASE_SERVICE_KEY[:15] + "..." if SUPABASE_SERVICE_KEY else "(VACÍO)"
             logger.info(f"Connecting to Supabase: URL={url_preview} KEY={key_preview}")
 
             if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-                logger.error("SUPABASE_URL o SUPABASE_SERVICE_KEY están vacíos!")
                 raise ValueError("Supabase credentials missing")
 
             self._client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -55,7 +53,7 @@ class SupabaseClient:
                 logger.info(f"Trade insertado: {result.data[0]['id']}")
                 return result.data[0]
             else:
-                logger.warning(f"Trade insert retornó data vacía: {result}")
+                logger.warning(f"Trade insert retornó data vacía")
         except Exception as e:
             logger.error(f"Error insertando trade: {e}", exc_info=True)
         return None
@@ -131,28 +129,19 @@ class SupabaseClient:
             result = self.client.table("futures_candles").upsert(
                 candle_data, on_conflict="symbol,open_time"
             ).execute()
-            # ── FIX: Log de éxito para confirmar que los datos llegan ──
             if result.data:
                 logger.info(
                     f"✅ Candle saved: {candle_data.get('symbol')} | "
                     f"open_time={candle_data.get('open_time')} | "
                     f"close={candle_data.get('close')}"
                 )
-            else:
-                logger.warning(
-                    f"⚠️ Candle upsert returned empty: {candle_data.get('symbol')} | "
-                    f"result={result}"
-                )
         except Exception as e:
-            # ── FIX: exc_info=True para ver traceback completo ──
             logger.error(
                 f"❌ Error insertando vela {candle_data.get('symbol')}: {e}",
                 exc_info=True,
             )
 
-    async def get_candles(
-        self, symbol: str, limit: int = 200
-    ) -> list[dict]:
+    async def get_candles(self, symbol: str, limit: int = 200) -> list[dict]:
         """Obtiene las últimas N velas de un símbolo."""
         try:
             result = (
@@ -187,7 +176,7 @@ class SupabaseClient:
             logger.error(f"Error insertando señal: {e}", exc_info=True)
             return None
 
-    # ── Bot State ──────────────────────────────────────────
+    # ── Bot State & Wallet ─────────────────────────────────
 
     async def get_bot_state(self) -> dict | None:
         """Obtiene el estado actual del bot."""
@@ -214,6 +203,85 @@ class SupabaseClient:
                 ).execute()
         except Exception as e:
             logger.error(f"Error actualizando estado del bot: {e}")
+
+    async def update_wallet_balance(self, pnl_net: float) -> float:
+        """
+        Actualiza el balance de la wallet virtual sumando el P&L neto.
+
+        Args:
+            pnl_net: Ganancia/pérdida neta del trade (puede ser negativa)
+
+        Returns:
+            El nuevo balance después de la actualización
+        """
+        try:
+            state = await self.get_bot_state()
+            if not state:
+                logger.error("No se encontró bot_state para actualizar balance")
+                return 0.0
+
+            old_balance = float(state.get("total_balance", 0))
+            new_balance = old_balance + pnl_net
+
+            # Calcular max drawdown
+            max_dd = float(state.get("max_drawdown", 0))
+            if new_balance < old_balance and old_balance > 0:
+                current_dd = (old_balance - new_balance) / old_balance
+                max_dd = max(max_dd, current_dd)
+
+            # Calcular avg_win y avg_loss
+            total_wins = int(state.get("total_wins", 0))
+            total_losses = int(state.get("total_losses", 0))
+            old_avg_win = float(state.get("avg_win", 0))
+            old_avg_loss = float(state.get("avg_loss", 0))
+
+            if pnl_net > 0:
+                new_avg_win = (
+                    (old_avg_win * total_wins + pnl_net) / (total_wins + 1)
+                    if total_wins >= 0
+                    else pnl_net
+                )
+                updates = {"avg_win": round(new_avg_win, 8)}
+            else:
+                new_avg_loss = (
+                    (old_avg_loss * total_losses + pnl_net) / (total_losses + 1)
+                    if total_losses >= 0
+                    else pnl_net
+                )
+                updates = {"avg_loss": round(new_avg_loss, 8)}
+
+            # Calcular profit factor
+            total_gross_wins = old_avg_win * total_wins + (pnl_net if pnl_net > 0 else 0)
+            total_gross_losses = abs(old_avg_loss * total_losses) + (abs(pnl_net) if pnl_net < 0 else 0)
+            profit_factor = (
+                total_gross_wins / total_gross_losses
+                if total_gross_losses > 0
+                else 0
+            )
+
+            updates.update({
+                "total_balance": round(new_balance, 4),
+                "available_balance": round(new_balance, 4),
+                "max_drawdown": round(max_dd, 4),
+                "profit_factor": round(profit_factor, 4),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            self.client.table("futures_bot_state").update(updates).eq(
+                "id", state["id"]
+            ).execute()
+
+            logger.info(
+                f"💰 Wallet: ${old_balance:.2f} → ${new_balance:.2f} "
+                f"(PnL: {'+' if pnl_net >= 0 else ''}{pnl_net:.4f})"
+            )
+
+            return new_balance
+
+        except Exception as e:
+            logger.error(f"Error actualizando wallet: {e}", exc_info=True)
+            state = await self.get_bot_state()
+            return float(state.get("total_balance", 0)) if state else 0.0
 
     # ── Trailing History ───────────────────────────────────
 
@@ -249,6 +317,69 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error obteniendo datos de entrenamiento: {e}")
             return []
+
+    # ── Data Pruning (Limpieza) ────────────────────────────
+
+    async def prune_old_data(self, days: int = 15) -> dict:
+        """
+        Elimina datos más antiguos que 'days' días.
+
+        Borra:
+        - futures_candles con open_time más viejo que el cutoff
+        - futures_signals con created_at más viejo
+        - futures_trades CERRADOS con closed_at más viejo
+          (los OPEN nunca se borran)
+
+        Returns:
+            dict con conteos de filas eliminadas
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff.isoformat()
+        cutoff_ms = int(cutoff.timestamp() * 1000)
+
+        deleted = {"candles": 0, "signals": 0, "trades": 0}
+
+        # ── 1. Candles (usa open_time en milliseconds) ──
+        try:
+            result = (
+                self.client.table("futures_candles")
+                .delete()
+                .lt("open_time", cutoff_ms)
+                .execute()
+            )
+            deleted["candles"] = len(result.data) if result.data else 0
+            logger.info(f"Pruned {deleted['candles']} candles")
+        except Exception as e:
+            logger.error(f"Error pruning candles: {e}")
+
+        # ── 2. Signals (usa created_at timestamp) ──
+        try:
+            result = (
+                self.client.table("futures_signals")
+                .delete()
+                .lt("created_at", cutoff_iso)
+                .execute()
+            )
+            deleted["signals"] = len(result.data) if result.data else 0
+            logger.info(f"Pruned {deleted['signals']} signals")
+        except Exception as e:
+            logger.error(f"Error pruning signals: {e}")
+
+        # ── 3. Trades cerrados (nunca borrar OPEN) ──
+        try:
+            result = (
+                self.client.table("futures_trades")
+                .delete()
+                .eq("status", "CLOSED")
+                .lt("closed_at", cutoff_iso)
+                .execute()
+            )
+            deleted["trades"] = len(result.data) if result.data else 0
+            logger.info(f"Pruned {deleted['trades']} closed trades")
+        except Exception as e:
+            logger.error(f"Error pruning trades: {e}")
+
+        return deleted
 
 
 # Instancia global
