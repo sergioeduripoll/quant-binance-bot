@@ -51,6 +51,11 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.05"))               # 5% m
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
 MAX_LEVERAGE = 20
 
+# ── Balance Inicial para TEST/PAPER ──────────────────────
+# Capital virtual con el que arranca la simulación
+# 50 USDT = equivalente a ~50.000 ARS
+TEST_INITIAL_BALANCE = float(os.getenv("TEST_INITIAL_BALANCE", "50"))
+
 # ── Comisiones Binance Futuros ───────────────────────────
 MAKER_FEE = 0.0002    # 0.02%
 TAKER_FEE = 0.0004    # 0.04%

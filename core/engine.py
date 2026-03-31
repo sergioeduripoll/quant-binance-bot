@@ -7,7 +7,8 @@ import asyncio
 from datetime import datetime, timezone
 
 from config.settings import (
-    BOT_MODE, BotMode, ML_RETRAIN_INTERVAL_HOURS, CANDLE_INTERVAL
+    BOT_MODE, BotMode, ML_RETRAIN_INTERVAL_HOURS,
+    CANDLE_INTERVAL, TEST_INITIAL_BALANCE,
 )
 from config.pairs import get_all_symbols, get_pair_config
 from core.websocket_manager import WebSocketManager
@@ -56,7 +57,10 @@ class Engine:
             db.initialize()
             logger.info("Database initialized")
 
-            # ── 2. Inicializar ML ──
+            # ── 2. Inicializar balance simulado ──
+            await self._initialize_balance()
+
+            # ── 3. Inicializar ML ──
             await self.predictor.initialize()
             if self.predictor.is_ready:
                 self.strategy.set_ml_predictor(self.predictor)
@@ -64,16 +68,16 @@ class Engine:
             else:
                 logger.info("ML predictor not ready (collecting data)")
 
-            # ── 3. Cargar historial de velas ──
+            # ── 4. Cargar historial de velas ──
             await self._load_candle_history()
 
-            # ── 4. Registrar callbacks ──
+            # ── 5. Registrar callbacks ──
             self.candle_processor.on_pre_close(self._on_pre_close)
             self.candle_processor.on_close(self._on_candle_close)
             self.ws_manager.on_kline(self.candle_processor.process_kline)
             self.ws_manager.on_ticker(self._on_ticker)
 
-            # ── 5. Notificar inicio ──
+            # ── 6. Notificar inicio ──
             balance = await self._get_balance()
             await self.notifier.send_message(
                 f"🚀 <b>Bot Scalping iniciado</b>\n"
@@ -83,7 +87,7 @@ class Engine:
                 f"ML: {'✅ Ready' if self.predictor.is_ready else '⏳ Collecting data'}"
             )
 
-            # ── 6. Iniciar loops ──
+            # ── 7. Iniciar loops ──
             self._running = True
             await asyncio.gather(
                 self.ws_manager.connect(),
@@ -97,6 +101,66 @@ class Engine:
             raise
         finally:
             await self.shutdown()
+
+    async def _initialize_balance(self):
+        """
+        Inicializa el balance virtual para TEST/PAPER.
+        
+        Si futures_bot_state no tiene registro o tiene balance 0,
+        lo crea/actualiza con TEST_INITIAL_BALANCE.
+        Solo aplica en modos TEST y PAPER.
+        """
+        if BOT_MODE == BotMode.LIVE:
+            logger.info("Modo LIVE: balance real de Binance")
+            return
+
+        state = await db.get_bot_state()
+
+        if state is None:
+            # No existe registro → crear con balance inicial
+            logger.info(
+                f"Creando estado inicial: ${TEST_INITIAL_BALANCE:.2f} USDT"
+            )
+            try:
+                db.client.table("futures_bot_state").insert({
+                    "total_balance": TEST_INITIAL_BALANCE,
+                    "available_balance": TEST_INITIAL_BALANCE,
+                    "unrealized_pnl": 0,
+                    "daily_pnl": 0,
+                    "daily_trades": 0,
+                    "daily_wins": 0,
+                    "daily_losses": 0,
+                    "total_trades": 0,
+                    "total_wins": 0,
+                    "total_losses": 0,
+                    "win_rate": 0,
+                    "avg_win": 0,
+                    "avg_loss": 0,
+                    "profit_factor": 0,
+                    "max_drawdown": 0,
+                    "samples_collected": 0,
+                }).execute()
+                logger.info(f"✅ Bot state creado: ${TEST_INITIAL_BALANCE:.2f}")
+            except Exception as e:
+                logger.error(f"Error creando bot_state: {e}")
+
+        elif float(state.get("total_balance", 0)) == 0:
+            # Existe pero balance es 0 → actualizar
+            logger.info(
+                f"Balance actual: $0. Seteando a ${TEST_INITIAL_BALANCE:.2f}"
+            )
+            await db.update_bot_state({
+                "total_balance": TEST_INITIAL_BALANCE,
+                "available_balance": TEST_INITIAL_BALANCE,
+            })
+            logger.info(f"✅ Balance actualizado: ${TEST_INITIAL_BALANCE:.2f}")
+
+        else:
+            current = float(state.get("total_balance", 0))
+            logger.info(
+                f"Balance existente: ${current:.2f} USDT "
+                f"(no se resetea automáticamente)"
+            )
 
     async def shutdown(self):
         """Apaga el bot de forma limpia."""
@@ -167,7 +231,6 @@ class Engine:
         Guarda vela en DB y actualiza indicadores.
         """
         try:
-            # ── FIX: Log de entrada al callback ──
             logger.info(
                 f"📝 Saving candle {symbol} | "
                 f"history_len={len(history)} | close={candle.close}"
@@ -252,9 +315,16 @@ class Engine:
                 logger.error(f"Error en ML retrain loop: {e}")
 
     async def _get_balance(self) -> float:
-        """Obtiene balance según el modo."""
+        """
+        Obtiene balance según el modo.
+        
+        - LIVE: balance real de Binance API
+        - TEST/PAPER: balance virtual de futures_bot_state
+        """
         if BOT_MODE == BotMode.LIVE:
             return await self.position_mgr.order_mgr.get_balance()
-        else:
-            state = await db.get_bot_state()
-            return float(state.get("total_balance", 100)) if state else 100.0
+
+        state = await db.get_bot_state()
+        if state:
+            return float(state.get("total_balance", TEST_INITIAL_BALANCE))
+        return TEST_INITIAL_BALANCE
