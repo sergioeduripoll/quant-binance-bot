@@ -57,7 +57,10 @@ class SignalGenerator:
         "trend_alignment": 0.15,
     }
 
-    def __init__(self, min_confidence: float = 0.55):
+    # ── FIX: Bajado de 0.55 a 0.40 ──
+    # El backtest mostró que 0.40 es el umbral óptimo para generar
+    # suficientes trades sin sacrificar calidad. El ML refinará después.
+    def __init__(self, min_confidence: float = 0.40):
         self.min_confidence = min_confidence
 
     def generate(

@@ -8,14 +8,51 @@ from typing import Optional
 
 
 def ema(data: np.ndarray, period: int) -> np.ndarray:
-    """Exponential Moving Average."""
-    result = np.full_like(data, np.nan)
+    """
+    Exponential Moving Average.
+
+    ╔══════════════════════════════════════════════════════════╗
+    ║  FIX: Manejo de NaN en datos de entrada                ║
+    ║                                                         ║
+    ║  ANTES: np.mean(data[:period]) con NaN → seed = NaN    ║
+    ║  → toda la EMA queda NaN (destruía MACD signal)        ║
+    ║                                                         ║
+    ║  AHORA: Busca el primer tramo de 'period' valores      ║
+    ║  válidos (sin NaN) y empieza la EMA desde ahí.         ║
+    ╚══════════════════════════════════════════════════════════╝
+    """
+    result = np.full(len(data), np.nan, dtype=float)
     if len(data) < period:
         return result
+
     k = 2.0 / (period + 1)
-    result[period - 1] = np.mean(data[:period])
-    for i in range(period, len(data)):
-        result[i] = data[i] * k + result[i - 1] * (1 - k)
+
+    # Encontrar el primer índice donde hay 'period' valores consecutivos sin NaN
+    start = -1
+    count = 0
+    for i in range(len(data)):
+        if not np.isnan(data[i]):
+            count += 1
+            if count >= period:
+                start = i - period + 1
+                break
+        else:
+            count = 0
+
+    if start < 0:
+        return result  # No hay suficientes datos válidos
+
+    # Seed: promedio de los primeros 'period' valores válidos
+    seed_idx = start + period - 1
+    result[seed_idx] = np.mean(data[start: start + period])
+
+    # Propagar EMA
+    for i in range(seed_idx + 1, len(data)):
+        if np.isnan(data[i]):
+            result[i] = result[i - 1]  # Mantener último valor si hay NaN aislado
+        else:
+            result[i] = data[i] * k + result[i - 1] * (1 - k)
+
     return result
 
 
@@ -101,7 +138,7 @@ def macd(
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
     macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal_period)
+    signal_line = ema(macd_line, signal_period)  # Ahora funciona con NaN prefix
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
 

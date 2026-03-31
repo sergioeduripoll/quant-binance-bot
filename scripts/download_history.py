@@ -190,13 +190,31 @@ def calculate_indicators_for_batch(candles: list[dict]) -> list[dict]:
 # ── Indicadores (copias locales para independencia del script) ──
 
 def _ema(data, period):
+    """EMA que maneja NaN prefix (fix para MACD signal)."""
     result = np.full_like(data, np.nan, dtype=float)
     if len(data) < period:
         return result
     k = 2.0 / (period + 1)
-    result[period - 1] = np.mean(data[:period])
-    for i in range(period, len(data)):
-        result[i] = data[i] * k + result[i - 1] * (1 - k)
+    # Encontrar primer tramo de 'period' valores sin NaN
+    start = -1
+    count = 0
+    for i in range(len(data)):
+        if not np.isnan(data[i]):
+            count += 1
+            if count >= period:
+                start = i - period + 1
+                break
+        else:
+            count = 0
+    if start < 0:
+        return result
+    seed_idx = start + period - 1
+    result[seed_idx] = np.mean(data[start: start + period])
+    for i in range(seed_idx + 1, len(data)):
+        if np.isnan(data[i]):
+            result[i] = result[i - 1]
+        else:
+            result[i] = data[i] * k + result[i - 1] * (1 - k)
     return result
 
 

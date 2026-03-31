@@ -23,7 +23,8 @@ class ScalpingStrategy:
     5. Retorna señal final para ejecución
     """
 
-    def __init__(self, min_confidence: float = 0.55):
+    # ── FIX: Bajado de 0.55 a 0.40 ──
+    def __init__(self, min_confidence: float = 0.40):
         self.signal_gen = SignalGenerator(min_confidence=min_confidence)
         self.ml_predictor = None  # Se inyecta después
 
